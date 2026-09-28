@@ -24,17 +24,25 @@ def refreshExtraData(db, missing, age, limit, concurrency=10, stock_only=False):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     missing = set(missing)
-    needed = max(0, limit - len(missing))
-    if needed > 0:
-        missing.update(db.getMissingExtra(needed, stock_only=stock_only))
+    if limit > 0:
+        needed = max(0, limit - len(missing))
+        if needed > 0:
+            missing.update(db.getMissingExtra(needed, stock_only=stock_only))
+    else:
+        # limit <= 0 means crawl all missing components
+        missing.update(db.getMissingExtra(1500000, stock_only=stock_only))
 
     if age > 0:
-        ageCount = min(age, max(0, limit - len(missing)))
+        ageCount = min(age, max(0, limit - len(missing))) if limit > 0 else age
         if ageCount > 0:
             print(f"{ageCount} components will be aged and thus refreshed")
             missing = missing.union(db.getNOldest(ageCount))
 
-    missing = list(missing)[:limit]
+    if limit > 0:
+        missing = list(missing)[:limit]
+    else:
+        missing = list(missing)
+
     if not missing:
         print("No missing LCSC extra data to refresh.")
         return
