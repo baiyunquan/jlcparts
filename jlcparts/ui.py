@@ -191,47 +191,56 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, concu
         with lib.startTransaction():
             lib.resetFlag(value=OLD)
 
-    interf = createComponentInterface(lastKey=checkpointState.get("lastKey"))
-    start = time.monotonic()
+    try:
+        interf = createComponentInterface(lastKey=checkpointState.get("lastKey"))
+    except RuntimeError as e:
+        if "Missing JLCPCB OpenAPI credential" in str(e):
+            print("JLCPCB OpenAPI credentials (JLCPCB_APP_ID) not configured.")
+            print("Skipping catalog pagination from JLC OpenAPI and proceeding directly to refresh LCSC extra data and images...")
+            interf = None
+        else:
+            raise
 
-    while True:
-        if max_seconds is not None and time.monotonic() - start >= max_seconds:
-            writeCheckpoint(checkpoint, db, interf.lastPage, count, False)
-            break
-
-        for i in range(retries):
-            try:
-                page = interf.getPage()
+    if interf is not None:
+        start = time.monotonic()
+        while True:
+            if max_seconds is not None and time.monotonic() - start >= max_seconds:
+                writeCheckpoint(checkpoint, db, interf.lastPage, count, False)
                 break
-            except Exception as e:
-                if i == retries - 1:
-                    raise e from None
-                time.sleep(retry_delay)
-        if page is None:
+
+            for i in range(retries):
+                try:
+                    page = interf.getPage()
+                    break
+                except Exception as e:
+                    if i == retries - 1:
+                        raise e from None
+                    time.sleep(retry_delay)
+            if page is None:
+                with lib.startTransaction():
+                    lib.removeWithFlag(value=OLD)
+                if checkpoint and os.path.exists(checkpoint):
+                    os.remove(checkpoint)
+                done = True
+                break
+
+            page = enrichComponentsFromWebsite(page)
+
             with lib.startTransaction():
-                lib.removeWithFlag(value=OLD)
-            if checkpoint and os.path.exists(checkpoint):
-                os.remove(checkpoint)
-            done = True
-            break
+                for apiComponent in page:
+                    isNew = not lib.exists(apiComponent["componentCode"])
+                    lib.updateJlcPayload(apiComponent, flag=REFRESHED)
+                    if isNew:
+                        missing.add(apiComponent["componentCode"])
 
-        page = enrichComponentsFromWebsite(page)
-
-        with lib.startTransaction():
-            for apiComponent in page:
-                isNew = not lib.exists(apiComponent["componentCode"])
-                lib.updateJlcPayload(apiComponent, flag=REFRESHED)
-                if isNew:
-                    missing.add(apiComponent["componentCode"])
-
-        count += len(page)
-        if verbose:
-            print(f"Fetched {count}")
-        writeCheckpoint(checkpoint, db, interf.lastPage, count, False)
+            count += len(page)
+            if verbose:
+                print(f"Fetched {count}")
+            writeCheckpoint(checkpoint, db, interf.lastPage, count, False)
 
     refreshExtraData(lib, missing, age, limit, concurrency=concurrency, stock_only=stock_only)
     if verbose:
-        print("Fetch complete" if done else "Fetch checkpointed")
+        print("Fetch complete" if (done or interf is None) else "Fetch checkpointed")
 
 
 @click.command()

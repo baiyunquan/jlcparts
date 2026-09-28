@@ -54,39 +54,47 @@ def makeLcscRequest(url, payload=None):
     return requests.get(url, params=newPayload)
 
 def pullPreferredComponents():
-    resp = requests.get("https://jlcpcb.com/api/overseas-pcb-order/v1/getAll")
-    token = resp.cookies.get_dict()["XSRF-TOKEN"]
+    try:
+        resp = requests.get("https://jlcpcb.com/api/overseas-pcb-order/v1/getAll", timeout=10)
+        cookies = resp.cookies.get_dict()
+        token = cookies.get("XSRF-TOKEN")
+        if not token:
+            return set()
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-XSRF-TOKEN": token,
-    }
-    PAGE_SIZE = 1000
-
-    currentPage = 1
-    components = set()
-    while True:
-        body = {
-            "currentPage": currentPage,
-            "pageSize": PAGE_SIZE,
-            "preferredComponentFlag": True
+        headers = {
+            "Content-Type": "application/json",
+            "X-XSRF-TOKEN": token,
         }
+        PAGE_SIZE = 1000
 
-        resp = requests.post(
-            "https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart/smtGood/selectSmtComponentList",
-            headers=headers,
-            json=body
-        )
+        currentPage = 1
+        components = set()
+        while True:
+            body = {
+                "currentPage": currentPage,
+                "pageSize": PAGE_SIZE,
+                "preferredComponentFlag": True
+            }
 
-        body = resp.json()
-        for c in [x["componentCode"] for x in body["data"]["componentPageInfo"]["list"]]:
-            components.add(c)
+            resp = requests.post(
+                "https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart/smtGood/selectSmtComponentList",
+                headers=headers,
+                json=body,
+                timeout=10
+            )
 
-        if not body["data"]["componentPageInfo"]["hasNextPage"]:
-            break
-        currentPage += 1
+            body = resp.json()
+            for c in [x["componentCode"] for x in body["data"]["componentPageInfo"]["list"]]:
+                components.add(c)
 
-    return components
+            if not body["data"]["componentPageInfo"]["hasNextPage"]:
+                break
+            currentPage += 1
+
+        return components
+    except Exception as e:
+        print(f"Warning: Failed to pull preferred components: {e}")
+        return set()
 
 if __name__ == "__main__":
     r = makeLcscRequest("https://ips.lcsc.com/rest/wmsc2agent/product/info/C7063")

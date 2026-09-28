@@ -139,7 +139,7 @@ jobs:
                              --concurrency "$concurrency" \
                              $stock_flag \
                              cache.sqlite3
-            jlcparts updatepreferred cache.sqlite3
+            jlcparts updatepreferred cache.sqlite3 || true
           else
             rm -f parts.checkpoint.json
           fi
