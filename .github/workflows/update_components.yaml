@@ -1,7 +1,28 @@
 name: "Update component database"
 on:
   push:
+    branches:
+      - master
+      - feat/*
   pull_request:
+  workflow_dispatch:
+    inputs:
+      fetch_limit:
+        description: "Maximum number of component extras/images to fetch"
+        required: true
+        default: "40000"
+      max_seconds:
+        description: "Maximum runtime in seconds (e.g. 7200 for 2 hours)"
+        required: true
+        default: "7200"
+      concurrency:
+        description: "Number of concurrent request workers"
+        required: true
+        default: "12"
+      stock_only:
+        description: "Prioritize in-stock components"
+        type: boolean
+        default: true
   schedule:
     - cron: '0 3 * * *'
     - cron: '0 11 * * *'
@@ -22,41 +43,43 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             python3 python3-pip nodejs npm wget zip unzip p7zip-full
-          sudo pip3 install requests click
+          sudo pip3 install requests click lxml --break-system-packages || sudo pip3 install requests click lxml
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
       - name: Build frontend
         run: |
           cd web
           if [ "$GITHUB_REPOSITORY" = 'yaqwsx/jlcparts-dev' ]; then
             export BASEURL=https://jlcparts-dev.honzamrazek.cz
+          elif [ -n "$GITHUB_REPOSITORY_OWNER" ]; then
+            export BASEURL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
           else
             export BASEURL=https://yaqwsx.github.io/jlcparts
           fi
           npm install --silent
           NODE_ENV=production PUBLIC_URL=${BASEURL} npm run build
-          if [ $GITHUB_REPOSITORY = 'yaqwsx/jlcparts-dev' ]; then
-            echo 'jlcparts-dev.honzamrazek.cz' > build/CNAME
-          fi
           touch build/.nojekyll
       - name: Build database files
-        env: # Or as an environment variable
-          LCSC_KEY: ${{ secrets.LCSC_KEY }}
-          LCSC_SECRET: ${{ secrets.LCSC_SECRET }}
-          JLCPCB_APP_ID: ${{ secrets.JLCPCB_APP_ID }}
-          JLCPCB_ACCESS_KEY: ${{ secrets.JLCPCB_ACCESS_KEY }}
-          JLCPCB_SECRET_KEY: ${{ secrets.JLCPCB_SECRET_KEY }}
+        env:
           WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+          INPUT_FETCH_LIMIT: ${{ inputs.fetch_limit }}
+          INPUT_MAX_SECONDS: ${{ inputs.max_seconds }}
+          INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+          INPUT_STOCK_ONLY: ${{ inputs.stock_only }}
         run: |
           set -x
-          sudo pip3 install -e .
+          sudo pip3 install -e . --break-system-packages || sudo pip3 install -e .
 
-          if [ "$GITHUB_REPOSITORY" = 'yaqwsx/jlcparts-dev' ]; then
-            export BASEURL=https://jlcparts-dev.honzamrazek.cz
+          # Determine data source URL: try own fork pages first, fallback to upstream yaqwsx
+          FORK_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/data"
+          UPSTREAM_URL="https://yaqwsx.github.io/jlcparts/data"
+
+          if wget --spider -q "${FORK_URL}/cache.zip"; then
+            export DATAURL="${FORK_URL}"
           else
-            export BASEURL=https://yaqwsx.github.io/jlcparts
+            export DATAURL="${UPSTREAM_URL}"
           fi
-          export DATAURL=${BASEURL}/data
+          echo "Using DATAURL: ${DATAURL}"
 
           if wget -q ${DATAURL}/cache.zip; then
             downloaded_parts=()
@@ -84,8 +107,8 @@ jobs:
             fi
           else
             rm -f cache.zip
-            if [ "$WORKFLOW_EVENT_NAME" != "schedule" ]; then
-              echo "No published cache found; only scheduled runs may fetch a fresh database from JLC"
+            if [ "$WORKFLOW_EVENT_NAME" != "schedule" ] && [ "$WORKFLOW_EVENT_NAME" != "workflow_dispatch" ]; then
+              echo "No published cache found; only scheduled or manual runs may fetch a fresh database"
               exit 1
             fi
             echo "No published cache found, bootstrapping a fresh database"
@@ -95,17 +118,26 @@ jobs:
             jlcparts migratecache cache.sqlite3
           fi
 
-          if [ "$WORKFLOW_EVENT_NAME" = "schedule" ]; then
+          if [ "$WORKFLOW_EVENT_NAME" = "schedule" ] || [ "$WORKFLOW_EVENT_NAME" = "workflow_dispatch" ]; then
             wget -q ${DATAURL}/parts.checkpoint.json || rm -f parts.checkpoint.json
 
-            fetch_seconds=${JLCPARTS_FETCH_SECONDS:-2400}
+            fetch_seconds=${INPUT_MAX_SECONDS:-${JLCPARTS_FETCH_SECONDS:-7200}}
+            lcsc_limit=${INPUT_FETCH_LIMIT:-${JLCPARTS_LCSC_LIMIT:-40000}}
+            concurrency=${INPUT_CONCURRENCY:-12}
             lcsc_age=${JLCPARTS_LCSC_AGE:-10000}
-            lcsc_limit=${JLCPARTS_LCSC_LIMIT:-1000}
+
+            stock_flag="--stock-only"
+            if [ "$INPUT_STOCK_ONLY" = "false" ]; then
+              stock_flag=""
+            fi
+
             jlcparts fetchdb --verbose \
                              --checkpoint parts.checkpoint.json \
                              --max-seconds "$fetch_seconds" \
                              --age "$lcsc_age" \
                              --limit "$lcsc_limit" \
+                             --concurrency "$concurrency" \
+                             $stock_flag \
                              cache.sqlite3
             jlcparts updatepreferred cache.sqlite3
           else
@@ -122,10 +154,16 @@ jobs:
 
           rm -f web/build/data/cache.z*
           zip -s 50m web/build/data/cache.zip cache.sqlite3
-      - name: Tar artifact # Artifact are case insensitive, this is workaround
+      - name: Upload raw database artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jlcparts_cache_database
+          path: cache.sqlite3
+          retention-days: 30
+      - name: Tar web artifact
         run: tar -czf web_build.tar.gz web/build/
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload web artifact
+        uses: actions/upload-artifact@v4
         with:
           name: web_build
           path: web_build.tar.gz
@@ -134,18 +172,18 @@ jobs:
     name: "Deploy"
     runs-on: ubuntu-24.04
     needs: build_and_update
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/feat/lcsc-open-api-crawler'
     steps:
-      - name: Checkout # Required for GH-pages deployment
-        uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: "Download web"
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           name: web_build
       - name: Untar artifact
         run: tar -xzf web_build.tar.gz
       - name: Deploy to GH Pages
-        uses: JamesIves/github-pages-deploy-action@v4.4.3
+        uses: JamesIves/github-pages-deploy-action@v4.6.0
         with:
           branch: gh-pages
           folder: web/build

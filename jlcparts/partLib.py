@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from textwrap import indent
 
-from .lcsc import makeLcscRequest
+from .lcsc import makeLcscRequest, fetchLcscProductDetail
 
 if os.environ.get("JLCPARTS_DEV", "0") == "1":
     print("Using caching from /tmp/jlcparts")
@@ -648,70 +648,87 @@ class FetchError(RuntimeError):
         super().__init__(message)
         self.reason = reason
 
-def getLcscExtraNew(lcscNumber, retries=10):
-    timeouts = [
-        "502 Bad Gateway",
-        "504 Gateway Time-out",
-        "504 ERROR",
-        "Too Many Requests",
-        "Please try again in a few minutes",
-        "403 Forbidden"
-    ]
-
+def getLcscExtraNew(lcscNumber, retries=5, session=None):
     try:
-        if retries == 0:
+        if retries <= 0:
             raise FetchError("Too many retries", None)
-        # Try to load fetched data from cache - useful when developing (saves time
-        # to fetch)
-        try:
-            if CACHE_PATH is None:
-                raise RuntimeError("Cache not used")
-            with open(CACHE_PATH / f"{lcscNumber}.json") as f:
-                resJson = json.load(f)
-            params = resJson["result"]
-        except:
-            # Not in cache, fetch
-            res = None
-            resJson = None
+
+        if CACHE_PATH is not None:
+            cache_file = CACHE_PATH / f"{lcscNumber}.json"
+            if cache_file.exists():
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+
+        result = fetchLcscProductDetail(lcscNumber, session=session)
+        if result is None:
+            return {}
+
+        product_images = result.get("productImages") or []
+        images = []
+        for img_url in product_images:
+            if not isinstance(img_url, str):
+                continue
+            filename = img_url.rsplit("/", 1)[-1]
+            images.append({
+                "original": img_url,
+                "small": img_url.replace("/900x900/", "/96x96/"),
+                "medium": img_url.replace("/900x900/", "/224x224/"),
+                "filename": filename
+            })
+
+        attributes = {}
+        for param in (result.get("paramVOList") or []):
+            if not isinstance(param, dict):
+                continue
+            name = param.get("paramNameEn") or param.get("paramName")
+            val = param.get("paramValueEn") or param.get("paramValue")
+            if name and val is not None:
+                attributes[str(name)] = str(val)
+
+        brand_name = result.get("brandNameEn") or ""
+        manufacturer = {
+            "name": brand_name,
+            "en": brand_name,
+            "id": result.get("brandId")
+        }
+
+        catalog_slug = normalizeUrlPart(result.get("catalogName") or "")
+        title_slug = normalizeUrlPart(result.get("title") or "")
+        code_str = str(lcscNumber).strip()
+        code_str = code_str if code_str.upper().startswith("C") else f"C{code_str}"
+        url = f"https://www.lcsc.com/product-detail/{catalog_slug}_{title_slug}_{code_str}.html"
+
+        extra = {
+            "images": images,
+            "attributes": attributes,
+            "manufacturer": manufacturer,
+            "url": url,
+            "title": result.get("title") or "",
+            "datasheet": result.get("pdfUrl") or "",
+            "package": result.get("encapStandard") or "",
+            "stock": result.get("stockNumber") or 0,
+        }
+
+        if CACHE_PATH is not None:
+            cache_file = CACHE_PATH / f"{lcscNumber}.json"
             try:
-                res = makeLcscRequest(f"https://ips.lcsc.com/rest/wmsc2agent/product/info/{lcscNumber}")
-                if res.status_code != 200:
-                    if any([x in res.text for x in timeouts]):
-                        raise TimeoutError(res.text)
-                resJson = res.json()
-                if resJson["code"] in [563, 564, 429]:
-                    # The component was not found on LCSC - probably discontinued
-                    return {}
-                if resJson["code"] != 200:
-                    if resJson["code"] == 437:  # Rate limit exceeded
-                        print(f"Rate limit exceeded for {lcscNumber}. Retrying in 1 minute... ({retries-1} retries left)")
-                        time.sleep(60)
-                        return getLcscExtraNew(lcscNumber, retries=retries-1)
-                    else:
-                        raise RuntimeError(f"{resJson['code']}: {resJson['message']}")
-                params = resJson["result"]
-            except TimeoutError as e:
-                raise e from None
-            except Exception as e:
-                message = f"{res.status_code}: {res.text}"
-                raise FetchError(message, e) from None
-            # Save to cache, make development more pleasant
-            if CACHE_PATH is not None:
-                with open(CACHE_PATH / f"{lcscNumber}.json", "w") as f:
-                    json.dump(resJson, f)
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(extra, f)
+            except Exception:
+                pass
 
-        url = _buildLcscProductUrl(params)
-        if url is not None:
-            params["url"] = url
+        return extra
 
-        return params
-    except TimeoutError as e:
-        time.sleep(60)
-        return getLcscExtraNew(lcscNumber, retries=retries-1)
-    except FetchError as e:
-        reason = f"{e}: \n{e.reason}"
-        print(f"Failed {lcscNumber}:\n" + indent(reason, 8 * " "))
-        raise e from None
+    except Exception as e:
+        if retries > 1:
+            time.sleep(1)
+            return getLcscExtraNew(lcscNumber, retries=retries - 1, session=session)
+        reason = f"{e}"
+        print(f"Failed {lcscNumber}: {reason}")
+        raise FetchError(f"Failed {lcscNumber}: {reason}", e) from None
 
 def loadJlcTable(file):
     reader = _csvDictReader(file)

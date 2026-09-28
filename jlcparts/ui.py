@@ -20,26 +20,52 @@ def fetchLcscData(lcsc):
     except Exception as e:
         return (lcsc, None, f"{type(e).__name__}: {e}")
 
-def refreshExtraData(db, missing, age, limit):
+def refreshExtraData(db, missing, age, limit, concurrency=10, stock_only=False):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     missing = set(missing)
-    missing.update(db.getMissingExtra(max(0, limit - len(missing))))
+    needed = max(0, limit - len(missing))
+    if needed > 0:
+        missing.update(db.getMissingExtra(needed, stock_only=stock_only))
 
-    ageCount = min(age, max(0, limit - len(missing)))
-    print(f"{ageCount} components will be aged and thus refreshed")
-    missing = missing.union(db.getNOldest(ageCount))
+    if age > 0:
+        ageCount = min(age, max(0, limit - len(missing)))
+        if ageCount > 0:
+            print(f"{ageCount} components will be aged and thus refreshed")
+            missing = missing.union(db.getNOldest(ageCount))
 
-    # Truncate the missing components to respect the limit:
     missing = list(missing)[:limit]
     if not missing:
+        print("No missing LCSC extra data to refresh.")
         return
 
-    with Pool(processes=10) as pool:
-        for i, (lcsc, extra, error) in enumerate(pool.imap_unordered(fetchLcscData, missing)):
+    print(f"Refreshing extra data and images for {len(missing)} components (concurrency={concurrency})...")
+    start_time = time.time()
+    success_count = 0
+    skipped_count = 0
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(fetchLcscData, lcsc): lcsc for lcsc in missing}
+        total = len(missing)
+        for i, future in enumerate(as_completed(futures)):
+            lcsc, extra, error = future.result()
             if error is not None:
-                print(f"  {lcsc} skipped. {((i+1) / len(missing) * 100):.2f} % ({error})")
+                skipped_count += 1
+                if i % 100 == 0 or i == total - 1:
+                    print(f"  [{i+1}/{total}] ({((i+1)/total*100):.1f}%) {lcsc} skipped: {error}")
                 continue
-            print(f"  {lcsc} fetched. {((i+1) / len(missing) * 100):.2f} %")
+
+            success_count += 1
             db.updateExtra(lcsc, extra)
+            if i % 100 == 0 or i == total - 1:
+                elapsed = max(0.01, time.time() - start_time)
+                rate = (i + 1) / elapsed
+                has_img = bool(extra and extra.get("images"))
+                img_info = f", image: {len(extra.get('images', []))}" if has_img else ", no image"
+                print(f"  [{i+1}/{total}] ({((i+1)/total*100):.1f}%) {lcsc} fetched ({rate:.1f} req/s{img_info})")
+
+    elapsed = max(0.01, time.time() - start_time)
+    print(f"Completed refresh of {len(missing)} components in {elapsed:.1f}s ({success_count} updated, {skipped_count} skipped).")
 
 def apiComponentToDbComponent(component):
     from .jlcpcb import normalizeComponent
@@ -127,9 +153,13 @@ def getLibrary(source, db, age, limit, partial, skip):
     help="Retry failed JLCPCB API pages this many times")
 @click.option("--retry-delay", type=int, default=5,
     help="Wait this many seconds between JLCPCB API retries")
+@click.option("--concurrency", type=int, default=10,
+    help="Number of concurrent workers for LCSC requests")
+@click.option("--stock-only", is_flag=True, default=False,
+    help="Prioritize and only fetch components with stock > 0")
 @click.option("--verbose", is_flag=True,
     help="Be verbose")
-def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, verbose):
+def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, concurrency, stock_only, verbose):
     """
     Fetch JLC PCB component data directly into DB.
     """
@@ -199,9 +229,26 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, verbo
             print(f"Fetched {count}")
         writeCheckpoint(checkpoint, db, interf.lastPage, count, False)
 
-    refreshExtraData(lib, missing, age, limit)
+    refreshExtraData(lib, missing, age, limit, concurrency=concurrency, stock_only=stock_only)
     if verbose:
         print("Fetch complete" if done else "Fetch checkpointed")
+
+
+@click.command()
+@click.argument("db", type=click.Path(dir_okay=False, writable=True))
+@click.option("--limit", type=int, default=1000,
+    help="Limit number of component extras/images to fetch")
+@click.option("--concurrency", type=int, default=10,
+    help="Number of concurrent workers for LCSC requests")
+@click.option("--stock-only", is_flag=True, default=False,
+    help="Only fetch components with stock > 0")
+def fetchextra(db, limit, concurrency, stock_only):
+    """
+    Fetch LCSC extra details and preview images for components in DB.
+    """
+    lib = SourceDb(db)
+    missing = lib.getMissingExtra(limit, stock_only=stock_only)
+    refreshExtraData(lib, missing, age=0, limit=limit, concurrency=concurrency, stock_only=stock_only)
 
 
 
@@ -328,6 +375,7 @@ cli.add_command(updatePreferred)
 cli.add_command(migratecache)
 cli.add_command(fetchDetails)
 cli.add_command(fetchDb)
+cli.add_command(fetchextra)
 cli.add_command(fetchTable)
 cli.add_command(testComponent)
 

@@ -146,12 +146,14 @@ def _imageName(extra):
     if not images:
         return None
     firstImage = images[0] if isinstance(images, list) and images else None
-    if not isinstance(firstImage, dict):
-        return None
-    imageUrls = [value for value in firstImage.values() if isinstance(value, str)]
-    if not imageUrls:
-        return None
-    return imageUrls[0].rsplit("/", 1)[1]
+    if isinstance(firstImage, str):
+        return firstImage.rsplit("/", 1)[-1]
+    if isinstance(firstImage, dict):
+        imageUrls = [value for value in firstImage.values() if isinstance(value, str)]
+        if not imageUrls:
+            return None
+        return imageUrls[0].rsplit("/", 1)[-1]
+    return None
 
 
 def _urlSlug(extra):
@@ -474,18 +476,20 @@ class SourceDb:
             """, (count,))
         return map(lambda row: lcscFromDb(row["lcsc"]), cursor)
 
-    def getMissingExtra(self, count):
+    def getMissingExtra(self, count, stock_only=False):
         if count == 0:
             return []
-        cursor = self.conn.execute("""
+        stock_filter = "AND j.stock > 0" if stock_only else ""
+        cursor = self.conn.execute(f"""
             SELECT j.lcsc
             FROM jlc_components j
             LEFT JOIN lcsc_components l ON l.lcsc = j.lcsc
-            WHERE l.lcsc IS NULL OR l.attributes = '{}'
-            ORDER BY COALESCE(l.fetched_at, 0) ASC
+            WHERE (l.lcsc IS NULL OR l.image IS NULL OR l.image = '' OR l.attributes = '{{}}')
+            {stock_filter}
+            ORDER BY (j.stock > 0) DESC, j.stock DESC, j.preferred DESC, COALESCE(l.fetched_at, 0) ASC
             LIMIT ?
             """, (count,))
-        return map(lambda row: lcscFromDb(row["lcsc"]), cursor)
+        return list(map(lambda row: lcscFromDb(row["lcsc"]), cursor))
 
     def setPreferred(self, lcscSet):
         self.conn.execute("UPDATE jlc_components SET preferred = 0")

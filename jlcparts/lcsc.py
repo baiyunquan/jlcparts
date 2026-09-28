@@ -11,6 +11,30 @@ from requests.exceptions import ConnectionError
 LCSC_KEY = os.environ.get("LCSC_KEY")
 LCSC_SECRET = os.environ.get("LCSC_SECRET")
 
+def fetchLcscProductDetail(lcscNumber, session=None, timeout=10):
+    """
+    Fetch component details and image URLs from LCSC public API.
+    Does not require any API keys or secrets.
+    """
+    code_str = str(lcscNumber).strip()
+    if not code_str.upper().startswith("C"):
+        code_str = f"C{code_str}"
+    else:
+        code_str = code_str.upper()
+
+    url = f"https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={code_str}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    client = session or requests
+    resp = client.get(url, headers=headers, timeout=timeout)
+    if resp.status_code == 200:
+        data = resp.json()
+        if data.get("code") == 200:
+            return data.get("result")
+    return None
+
 def makeLcscRequest(url, payload=None):
     if payload is None:
         payload = {}
