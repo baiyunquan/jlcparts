@@ -1,9 +1,13 @@
 from multiprocessing import Pool
 import json
 import os
+import threading
 import time
 
 import click
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 from jlcparts.datatables import buildtables, normalizeAttribute
 from jlcparts.lcsc import pullPreferredComponents
@@ -12,15 +16,36 @@ from jlcparts.partLib import (PartLibrary, PartLibraryDb, getLcscExtraNew,
 from jlcparts.sourceDb import SourceDb, migrateCache
 from jlcparts.webdb import buildwebdb
 
+_thread_local = threading.local()
+
+def _get_thread_session():
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=retry_strategy,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _thread_local.session = session
+    return _thread_local.session
 
 def fetchLcscData(lcsc):
     try:
-        extra = getLcscExtraNew(lcsc)
+        session = _get_thread_session()
+        extra = getLcscExtraNew(lcsc, session=session)
         return (lcsc, extra, None)
     except Exception as e:
         return (lcsc, None, f"{type(e).__name__}: {e}")
 
-def refreshExtraData(db, missing, age, limit, concurrency=10, stock_only=False):
+def refreshExtraData(db, missing, age, limit, concurrency=24, stock_only=False, max_seconds=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     missing = set(missing)
@@ -56,6 +81,11 @@ def refreshExtraData(db, missing, age, limit, concurrency=10, stock_only=False):
         futures = {executor.submit(fetchLcscData, lcsc): lcsc for lcsc in missing}
         total = len(missing)
         for i, future in enumerate(as_completed(futures)):
+            if max_seconds is not None and (time.time() - start_time) >= max_seconds:
+                print(f"  Reached max_seconds ({max_seconds}s). Stopping early to preserve progress and save database...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
             lcsc, extra, error = future.result()
             if error is not None:
                 skipped_count += 1
@@ -161,7 +191,7 @@ def getLibrary(source, db, age, limit, partial, skip):
     help="Retry failed JLCPCB API pages this many times")
 @click.option("--retry-delay", type=int, default=5,
     help="Wait this many seconds between JLCPCB API retries")
-@click.option("--concurrency", type=int, default=10,
+@click.option("--concurrency", type=int, default=24,
     help="Number of concurrent workers for LCSC requests")
 @click.option("--stock-only", is_flag=True, default=False,
     help="Prioritize and only fetch components with stock > 0")
@@ -181,6 +211,7 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, concu
     if max_seconds is not None and checkpoint is None:
         raise RuntimeError("max-seconds requires a checkpoint so the fetch can resume")
 
+    start_overall = time.monotonic()
     OLD = 0
     REFRESHED = 1
 
@@ -246,7 +277,12 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, concu
                 print(f"Fetched {count}")
             writeCheckpoint(checkpoint, db, interf.lastPage, count, False)
 
-    refreshExtraData(lib, missing, age, limit, concurrency=concurrency, stock_only=stock_only)
+    remaining_seconds = None
+    if max_seconds is not None:
+        elapsed = time.monotonic() - start_overall
+        remaining_seconds = max(60, int(max_seconds - elapsed))
+
+    refreshExtraData(lib, missing, age, limit, concurrency=concurrency, stock_only=stock_only, max_seconds=remaining_seconds)
     if verbose:
         print("Fetch complete" if (done or interf is None) else "Fetch checkpointed")
 
@@ -255,17 +291,19 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, concu
 @click.argument("db", type=click.Path(dir_okay=False, writable=True))
 @click.option("--limit", type=int, default=1000,
     help="Limit number of component extras/images to fetch")
-@click.option("--concurrency", type=int, default=10,
+@click.option("--concurrency", type=int, default=24,
     help="Number of concurrent workers for LCSC requests")
 @click.option("--stock-only", is_flag=True, default=False,
     help="Only fetch components with stock > 0")
-def fetchextra(db, limit, concurrency, stock_only):
+@click.option("--max-seconds", type=int, default=None,
+    help="Maximum runtime in seconds")
+def fetchextra(db, limit, concurrency, stock_only, max_seconds):
     """
     Fetch LCSC extra details and preview images for components in DB.
     """
     lib = SourceDb(db)
     missing = lib.getMissingExtra(limit, stock_only=stock_only)
-    refreshExtraData(lib, missing, age=0, limit=limit, concurrency=concurrency, stock_only=stock_only)
+    refreshExtraData(lib, missing, age=0, limit=limit, concurrency=concurrency, stock_only=stock_only, max_seconds=max_seconds)
 
 
 

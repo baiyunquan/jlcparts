@@ -10,7 +10,7 @@ on:
       fetch_limit:
         description: "Maximum number of component extras/images to fetch (set 0 for unlimited)"
         required: true
-        default: "150000"
+        default: "0"
       max_seconds:
         description: "Maximum runtime in seconds (e.g. 18000 for 5 hours)"
         required: true
@@ -18,7 +18,7 @@ on:
       concurrency:
         description: "Number of concurrent request workers"
         required: true
-        default: "12"
+        default: "24"
       stock_only:
         description: "Only fetch components with stock > 0 (set false to include out-of-stock components)"
         type: boolean
@@ -121,9 +121,9 @@ jobs:
           if [ "$WORKFLOW_EVENT_NAME" = "schedule" ] || [ "$WORKFLOW_EVENT_NAME" = "workflow_dispatch" ]; then
             wget -q ${DATAURL}/parts.checkpoint.json || rm -f parts.checkpoint.json
 
-            fetch_seconds=${INPUT_MAX_SECONDS:-${JLCPARTS_FETCH_SECONDS:-7200}}
-            lcsc_limit=${INPUT_FETCH_LIMIT:-${JLCPARTS_LCSC_LIMIT:-40000}}
-            concurrency=${INPUT_CONCURRENCY:-12}
+            fetch_seconds=${INPUT_MAX_SECONDS:-${JLCPARTS_FETCH_SECONDS:-18000}}
+            lcsc_limit=${INPUT_FETCH_LIMIT:-${JLCPARTS_LCSC_LIMIT:-0}}
+            concurrency=${INPUT_CONCURRENCY:-24}
             lcsc_age=${JLCPARTS_LCSC_AGE:-10000}
 
             stock_flag=""
