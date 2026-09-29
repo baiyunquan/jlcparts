@@ -1,15 +1,33 @@
+# Databases and caches
 *.sqlite*
-.idea
-*.zip
-*.z*
+*.db
+*.db-*
+cache.sqlite*
+parts.db
 manifest.json
 *.checkpoint.json
+
+# Crawler logs, state, and reports
 crawler_*_state.json
 consolidated_failed_components.json
 retry_*.json
 discontinued_*.json
 rate_limited_*.json
+
+# Downloaded resources, images, and archives
+downloaded_images/
+output_data/
 temp_*
+*.zip
+*.z*
+*.tar
+*.tar.gz
+*.7z
+!data/lcsc_queue.txt.gz
+
+# IDE and editor files
+.idea/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
