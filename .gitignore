@@ -4,6 +4,8 @@
 *.z*
 manifest.json
 *.checkpoint.json
+crawler_*_state.json
+temp_*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

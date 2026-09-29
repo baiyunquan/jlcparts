@@ -164,12 +164,7 @@ jobs:
 
           rm -f web/build/data/cache.z*
           zip -s 50m web/build/data/cache.zip cache.sqlite3
-      - name: Upload raw database artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: jlcparts_cache_batch_${{ inputs.batch_offset || '0' }}
-          path: cache.sqlite3
-          retention-days: 30
+
       - name: Upload failed components artifact
         if: always()
         uses: actions/upload-artifact@v4

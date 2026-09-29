@@ -39,12 +39,27 @@ def _get_thread_session():
         _thread_local.session = session
     return _thread_local.session
 
-def fetchLcscData(lcsc, jitter_range=(0.1, 0.3)):
+def fetchLcscData(lcsc, jitter_range=(0.1, 0.3), images_dir=None):
     if jitter_range and jitter_range[1] > 0:
         time.sleep(random.uniform(jitter_range[0], jitter_range[1]))
     try:
         session = _get_thread_session()
         extra = getLcscExtraNew(lcsc, session=session)
+        if images_dir and extra and extra.get("images"):
+            target_dir = Path(images_dir)
+            for img in extra.get("images", []):
+                small_url = img.get("small")
+                filename = img.get("filename")
+                if small_url and filename:
+                    img_path = target_dir / filename
+                    if not img_path.exists():
+                        try:
+                            r = session.get(small_url, timeout=5)
+                            if r.status_code == 200:
+                                with open(img_path, "wb") as f:
+                                    f.write(r.content)
+                        except Exception:
+                            pass
         return (lcsc, extra, None)
     except RateLimitError as e:
         return (lcsc, None, f"RateLimitError: {e}")
@@ -53,8 +68,12 @@ def fetchLcscData(lcsc, jitter_range=(0.1, 0.3)):
 
 def refreshExtraData(db, missing, age, limit=20000, concurrency=6, stock_only=True,
                      offset=0, max_seconds=None, jitter_range=(0.1, 0.3),
-                     failed_log_path="failed_components.json"):
+                     failed_log_path="failed_components.json",
+                     images_dir=None, crawled_output_path=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if images_dir:
+        Path(images_dir).mkdir(parents=True, exist_ok=True)
 
     target_components = list(missing)
     if limit > 0:
@@ -93,10 +112,11 @@ def refreshExtraData(db, missing, age, limit=20000, concurrency=6, stock_only=Tr
     success_count = 0
     skipped_count = 0
     failed_items = []
+    crawled_components = []
     consecutive_rate_limits = 0
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {executor.submit(fetchLcscData, lcsc, jitter_range): lcsc for lcsc in final_list}
+        futures = {executor.submit(fetchLcscData, lcsc, jitter_range, images_dir): lcsc for lcsc in final_list}
         total = len(final_list)
         for i, future in enumerate(as_completed(futures)):
             if max_seconds is not None and (time.time() - start_time) >= max_seconds:
@@ -128,6 +148,25 @@ def refreshExtraData(db, missing, age, limit=20000, concurrency=6, stock_only=Tr
             consecutive_rate_limits = 0
             success_count += 1
             db.updateExtra(lcsc, extra)
+
+            if extra:
+                mfr_name = ""
+                if isinstance(extra.get("manufacturer"), dict):
+                    mfr_name = extra.get("manufacturer", {}).get("name", "")
+                elif isinstance(extra.get("manufacturer"), str):
+                    mfr_name = extra.get("manufacturer")
+                img_name = extra.get("images", [{}])[0].get("filename", "") if extra.get("images") else ""
+                url_slug = extra.get("url", "").rsplit("/", 1)[-1].replace(".html", "") if extra.get("url") else ""
+
+                crawled_components.append({
+                    "lcsc": lcsc,
+                    "manufacturer": mfr_name,
+                    "attributes": extra.get("attributes", {}),
+                    "image": img_name,
+                    "url_slug": url_slug,
+                    "images": extra.get("images", [])
+                })
+
             if i % 50 == 0 or i == total - 1:
                 elapsed = max(0.01, time.time() - start_time)
                 rate = (i + 1) / elapsed
@@ -137,6 +176,21 @@ def refreshExtraData(db, missing, age, limit=20000, concurrency=6, stock_only=Tr
 
     elapsed = max(0.01, time.time() - start_time)
     print(f"Completed refresh of {len(final_list)} components in {elapsed:.1f}s ({success_count} updated, {skipped_count} failed/skipped).")
+
+    if crawled_output_path and crawled_components:
+        try:
+            p = Path(crawled_output_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.name.endswith(".gz"):
+                import gzip
+                with gzip.open(p, "wt", encoding="utf-8") as fp:
+                    json.dump(crawled_components, fp, ensure_ascii=False)
+            else:
+                with open(p, "w", encoding="utf-8") as fp:
+                    json.dump(crawled_components, fp, indent=2, ensure_ascii=False)
+            print(f"Saved {len(crawled_components)} crawled components to {crawled_output_path}")
+        except Exception as e:
+            print(f"Warning: Failed to write {crawled_output_path}: {e}")
 
     if failed_log_path:
         failed_summary = {
@@ -376,7 +430,11 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, offset, retries, retry_dela
     help="Maximum runtime in seconds")
 @click.option("--failed-log", type=str, default="failed_components.json",
     help="Path to save failed components log")
-def fetchextra(db, limit, offset, concurrency, jitter_min, jitter_max, stock_only, max_seconds, failed_log):
+@click.option("--images-dir", type=str, default=None,
+    help="Directory to save downloaded thumbnail images")
+@click.option("--crawled-output", type=str, default=None,
+    help="Path to save crawled components json/json.gz delta")
+def fetchextra(db, limit, offset, concurrency, jitter_min, jitter_max, stock_only, max_seconds, failed_log, images_dir, crawled_output):
     """
     Fetch LCSC extra details and preview images for components in DB.
     """
@@ -388,7 +446,9 @@ def fetchextra(db, limit, offset, concurrency, jitter_min, jitter_max, stock_onl
         offset=offset,
         max_seconds=max_seconds,
         jitter_range=(jitter_min, jitter_max),
-        failed_log_path=failed_log
+        failed_log_path=failed_log,
+        images_dir=images_dir,
+        crawled_output_path=crawled_output
     )
 
 
