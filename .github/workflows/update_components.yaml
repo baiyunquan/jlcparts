@@ -7,22 +7,26 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      fetch_limit:
-        description: "Maximum number of component extras/images to fetch (set 0 for unlimited)"
+      batch_offset:
+        description: "Offset in component queue to start fetching from (e.g. 0, 20000, 40000)"
         required: true
         default: "0"
+      fetch_limit:
+        description: "Maximum number of component extras/images to fetch (e.g. 20000)"
+        required: true
+        default: "20000"
       max_seconds:
-        description: "Maximum runtime in seconds (e.g. 18000 for 5 hours)"
+        description: "Maximum runtime in seconds (e.g. 14400 for 4 hours)"
         required: true
-        default: "18000"
+        default: "14400"
       concurrency:
-        description: "Number of concurrent request workers"
+        description: "Number of concurrent request workers (recommended: 6 to 8)"
         required: true
-        default: "24"
+        default: "6"
       stock_only:
-        description: "Only fetch components with stock > 0 (set false to include out-of-stock components)"
+        description: "Prioritize components with stock > 0"
         type: boolean
-        default: false
+        default: true
   schedule:
     - cron: '0 3 * * *'
     - cron: '0 11 * * *'
@@ -30,7 +34,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: update-components-${{ github.ref }}
+  group: update-components-${{ github.ref }}-${{ inputs.batch_offset || github.run_id }}
   cancel-in-progress: false
 jobs:
   build_and_update:
@@ -62,6 +66,7 @@ jobs:
       - name: Build database files
         env:
           WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+          INPUT_BATCH_OFFSET: ${{ inputs.batch_offset }}
           INPUT_FETCH_LIMIT: ${{ inputs.fetch_limit }}
           INPUT_MAX_SECONDS: ${{ inputs.max_seconds }}
           INPUT_CONCURRENCY: ${{ inputs.concurrency }}
@@ -121,14 +126,15 @@ jobs:
           if [ "$WORKFLOW_EVENT_NAME" = "schedule" ] || [ "$WORKFLOW_EVENT_NAME" = "workflow_dispatch" ]; then
             wget -q ${DATAURL}/parts.checkpoint.json || rm -f parts.checkpoint.json
 
-            fetch_seconds=${INPUT_MAX_SECONDS:-${JLCPARTS_FETCH_SECONDS:-18000}}
-            lcsc_limit=${INPUT_FETCH_LIMIT:-${JLCPARTS_LCSC_LIMIT:-0}}
-            concurrency=${INPUT_CONCURRENCY:-24}
+            batch_offset=${INPUT_BATCH_OFFSET:-0}
+            fetch_seconds=${INPUT_MAX_SECONDS:-${JLCPARTS_FETCH_SECONDS:-14400}}
+            lcsc_limit=${INPUT_FETCH_LIMIT:-${JLCPARTS_LCSC_LIMIT:-20000}}
+            concurrency=${INPUT_CONCURRENCY:-6}
             lcsc_age=${JLCPARTS_LCSC_AGE:-10000}
 
-            stock_flag=""
-            if [ "$INPUT_STOCK_ONLY" = "true" ]; then
-              stock_flag="--stock-only"
+            stock_flag="--stock-only"
+            if [ "$INPUT_STOCK_ONLY" = "false" ]; then
+              stock_flag=""
             fi
 
             jlcparts fetchdb --verbose \
@@ -136,7 +142,11 @@ jobs:
                              --max-seconds "$fetch_seconds" \
                              --age "$lcsc_age" \
                              --limit "$lcsc_limit" \
+                             --offset "$batch_offset" \
                              --concurrency "$concurrency" \
+                             --jitter-min 0.1 \
+                             --jitter-max 0.3 \
+                             --failed-log failed_components.json \
                              $stock_flag \
                              cache.sqlite3
             jlcparts updatepreferred cache.sqlite3 || true
@@ -157,29 +167,39 @@ jobs:
       - name: Upload raw database artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jlcparts_cache_database
+          name: jlcparts_cache_batch_${{ inputs.batch_offset || '0' }}
           path: cache.sqlite3
+          retention-days: 30
+      - name: Upload failed components artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed_components_batch_${{ inputs.batch_offset || '0' }}
+          path: |
+            failed_components.json
+            failed_components.txt
+          if-no-files-found: ignore
           retention-days: 30
       - name: Tar web artifact
         run: tar -czf web_build.tar.gz web/build/
       - name: Upload web artifact
         uses: actions/upload-artifact@v4
         with:
-          name: web_build
+          name: web_build_batch_${{ inputs.batch_offset || '0' }}
           path: web_build.tar.gz
           retention-days: 14
   deploy:
     name: "Deploy"
     runs-on: ubuntu-24.04
     needs: build_and_update
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/feat/lcsc-open-api-crawler'
+    if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/feat/lcsc-open-api-crawler') && (inputs.batch_offset == '' || inputs.batch_offset == '0')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: "Download web"
         uses: actions/download-artifact@v4
         with:
-          name: web_build
+          name: web_build_batch_${{ inputs.batch_offset || '0' }}
       - name: Untar artifact
         run: tar -xzf web_build.tar.gz
       - name: Deploy to GH Pages

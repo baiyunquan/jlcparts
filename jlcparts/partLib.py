@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from textwrap import indent
 
-from .lcsc import makeLcscRequest, fetchLcscProductDetail
+from .lcsc import makeLcscRequest, fetchLcscProductDetail, RateLimitError, LcscApiError
 
 if os.environ.get("JLCPARTS_DEV", "0") == "1":
     print("Using caching from /tmp/jlcparts")
@@ -722,6 +722,9 @@ def getLcscExtraNew(lcscNumber, retries=5, session=None):
 
         return extra
 
+    except RateLimitError as e:
+        print(f"Rate limited for {lcscNumber}: {e}")
+        raise
     except Exception as e:
         if retries > 1:
             time.sleep(1)

@@ -1,6 +1,8 @@
 from multiprocessing import Pool
 import json
 import os
+import random
+from pathlib import Path
 import threading
 import time
 
@@ -10,7 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 from jlcparts.datatables import buildtables, normalizeAttribute
-from jlcparts.lcsc import pullPreferredComponents
+from jlcparts.lcsc import pullPreferredComponents, RateLimitError
 from jlcparts.partLib import (PartLibrary, PartLibraryDb, getLcscExtraNew,
                               loadJlcTable, loadJlcTableLazy, parsePrice)
 from jlcparts.sourceDb import SourceDb, migrateCache
@@ -37,49 +39,65 @@ def _get_thread_session():
         _thread_local.session = session
     return _thread_local.session
 
-def fetchLcscData(lcsc):
+def fetchLcscData(lcsc, jitter_range=(0.1, 0.3)):
+    if jitter_range and jitter_range[1] > 0:
+        time.sleep(random.uniform(jitter_range[0], jitter_range[1]))
     try:
         session = _get_thread_session()
         extra = getLcscExtraNew(lcsc, session=session)
         return (lcsc, extra, None)
+    except RateLimitError as e:
+        return (lcsc, None, f"RateLimitError: {e}")
     except Exception as e:
         return (lcsc, None, f"{type(e).__name__}: {e}")
 
-def refreshExtraData(db, missing, age, limit, concurrency=24, stock_only=False, max_seconds=None):
+def refreshExtraData(db, missing, age, limit=20000, concurrency=6, stock_only=True,
+                     offset=0, max_seconds=None, jitter_range=(0.1, 0.3),
+                     failed_log_path="failed_components.json"):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    missing = set(missing)
+    target_components = list(missing)
     if limit > 0:
-        needed = max(0, limit - len(missing))
+        needed = max(0, limit - len(target_components))
         if needed > 0:
-            missing.update(db.getMissingExtra(needed, stock_only=stock_only))
+            extra_needed = db.getMissingExtra(needed, stock_only=stock_only, offset=offset)
+            target_components.extend(extra_needed)
     else:
-        # limit <= 0 means crawl all missing components
-        missing.update(db.getMissingExtra(1500000, stock_only=stock_only))
+        target_components.extend(db.getMissingExtra(1500000, stock_only=stock_only, offset=offset))
 
     if age > 0:
-        ageCount = min(age, max(0, limit - len(missing))) if limit > 0 else age
-        if ageCount > 0:
-            print(f"{ageCount} components will be aged and thus refreshed")
-            missing = missing.union(db.getNOldest(ageCount))
+        age_count = min(age, max(0, limit - len(target_components))) if limit > 0 else age
+        if age_count > 0:
+            print(f"{age_count} components will be aged and thus refreshed")
+            target_components.extend(db.getNOldest(age_count))
+
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for item in target_components:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
 
     if limit > 0:
-        missing = list(missing)[:limit]
+        final_list = deduped[:limit]
     else:
-        missing = list(missing)
+        final_list = deduped
 
-    if not missing:
+    if not final_list:
         print("No missing LCSC extra data to refresh.")
         return
 
-    print(f"Refreshing extra data and images for {len(missing)} components (concurrency={concurrency})...")
+    print(f"Refreshing extra data and images for {len(final_list)} components (offset={offset}, limit={limit}, concurrency={concurrency}, jitter={jitter_range}s, stock_only={stock_only})...")
     start_time = time.time()
     success_count = 0
     skipped_count = 0
+    failed_items = []
+    consecutive_rate_limits = 0
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {executor.submit(fetchLcscData, lcsc): lcsc for lcsc in missing}
-        total = len(missing)
+        futures = {executor.submit(fetchLcscData, lcsc, jitter_range): lcsc for lcsc in final_list}
+        total = len(final_list)
         for i, future in enumerate(as_completed(futures)):
             if max_seconds is not None and (time.time() - start_time) >= max_seconds:
                 print(f"  Reached max_seconds ({max_seconds}s). Stopping early to preserve progress and save database...")
@@ -89,13 +107,28 @@ def refreshExtraData(db, missing, age, limit, concurrency=24, stock_only=False, 
             lcsc, extra, error = future.result()
             if error is not None:
                 skipped_count += 1
-                if i % 100 == 0 or i == total - 1:
-                    print(f"  [{i+1}/{total}] ({((i+1)/total*100):.1f}%) {lcsc} skipped: {error}")
+                failed_items.append({
+                    "lcsc": lcsc,
+                    "error": str(error),
+                    "timestamp": int(time.time()),
+                })
+                if "RateLimitError" in str(error):
+                    consecutive_rate_limits += 1
+                    if consecutive_rate_limits >= 4:
+                        print(f"  [RateLimit Warning] Multiple rate limits detected, cooling down for 15s...")
+                        time.sleep(15)
+                        consecutive_rate_limits = 0
+                else:
+                    consecutive_rate_limits = 0
+
+                if i % 50 == 0 or i == total - 1:
+                    print(f"  [{i+1}/{total}] ({((i+1)/total*100):.1f}%) {lcsc} failed/skipped: {error}")
                 continue
 
+            consecutive_rate_limits = 0
             success_count += 1
             db.updateExtra(lcsc, extra)
-            if i % 100 == 0 or i == total - 1:
+            if i % 50 == 0 or i == total - 1:
                 elapsed = max(0.01, time.time() - start_time)
                 rate = (i + 1) / elapsed
                 has_img = bool(extra and extra.get("images"))
@@ -103,7 +136,29 @@ def refreshExtraData(db, missing, age, limit, concurrency=24, stock_only=False, 
                 print(f"  [{i+1}/{total}] ({((i+1)/total*100):.1f}%) {lcsc} fetched ({rate:.1f} req/s{img_info})")
 
     elapsed = max(0.01, time.time() - start_time)
-    print(f"Completed refresh of {len(missing)} components in {elapsed:.1f}s ({success_count} updated, {skipped_count} skipped).")
+    print(f"Completed refresh of {len(final_list)} components in {elapsed:.1f}s ({success_count} updated, {skipped_count} failed/skipped).")
+
+    if failed_log_path:
+        failed_summary = {
+            "total_requested": len(final_list),
+            "total_success": success_count,
+            "total_failed": len(failed_items),
+            "offset": offset,
+            "limit": limit,
+            "failed_items": failed_items,
+        }
+        try:
+            with open(failed_log_path, "w", encoding="utf-8") as f:
+                json.dump(failed_summary, f, indent=2, ensure_ascii=False)
+            print(f"Saved failed components summary to {failed_log_path} ({len(failed_items)} items)")
+
+            txt_path = Path(failed_log_path).with_suffix(".txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                for item in failed_items:
+                    f.write(f"{item['lcsc']}\t{item['error']}\n")
+            print(f"Saved failed components list to {txt_path}")
+        except Exception as e:
+            print(f"Warning: Failed to write failed_components log: {e}")
 
 def apiComponentToDbComponent(component):
     from .jlcpcb import normalizeComponent
@@ -185,19 +240,27 @@ def getLibrary(source, db, age, limit, partial, skip):
     help="Stop after roughly this many seconds and save the checkpoint")
 @click.option("--age", type=int, default=0,
     help="Automatically discard n oldest components and fetch them again")
-@click.option("--limit", type=int, default=10000,
+@click.option("--limit", type=int, default=20000,
     help="Limit number of newly added LCSC extra records")
+@click.option("--offset", type=int, default=0,
+    help="Offset in component queue to start fetching from")
 @click.option("--retries", type=int, default=10,
     help="Retry failed JLCPCB API pages this many times")
 @click.option("--retry-delay", type=int, default=5,
     help="Wait this many seconds between JLCPCB API retries")
-@click.option("--concurrency", type=int, default=24,
+@click.option("--concurrency", type=int, default=6,
     help="Number of concurrent workers for LCSC requests")
+@click.option("--jitter-min", type=float, default=0.1,
+    help="Minimum jitter delay in seconds")
+@click.option("--jitter-max", type=float, default=0.3,
+    help="Maximum jitter delay in seconds")
 @click.option("--stock-only", is_flag=True, default=False,
     help="Prioritize and only fetch components with stock > 0")
+@click.option("--failed-log", type=str, default="failed_components.json",
+    help="Path to save failed components log")
 @click.option("--verbose", is_flag=True,
     help="Be verbose")
-def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, concurrency, stock_only, verbose):
+def fetchDb(db, checkpoint, max_seconds, age, limit, offset, retries, retry_delay, concurrency, jitter_min, jitter_max, stock_only, failed_log, verbose):
     """
     Fetch JLC PCB component data directly into DB.
     """
@@ -282,28 +345,51 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, concu
         elapsed = time.monotonic() - start_overall
         remaining_seconds = max(60, int(max_seconds - elapsed))
 
-    refreshExtraData(lib, missing, age, limit, concurrency=concurrency, stock_only=stock_only, max_seconds=remaining_seconds)
+    refreshExtraData(
+        lib, missing, age, limit,
+        concurrency=concurrency,
+        stock_only=stock_only,
+        offset=offset,
+        max_seconds=remaining_seconds,
+        jitter_range=(jitter_min, jitter_max),
+        failed_log_path=failed_log
+    )
     if verbose:
         print("Fetch complete" if (done or interf is None) else "Fetch checkpointed")
 
 
 @click.command()
 @click.argument("db", type=click.Path(dir_okay=False, writable=True))
-@click.option("--limit", type=int, default=1000,
+@click.option("--limit", type=int, default=20000,
     help="Limit number of component extras/images to fetch")
-@click.option("--concurrency", type=int, default=24,
+@click.option("--offset", type=int, default=0,
+    help="Offset in component queue to start fetching from")
+@click.option("--concurrency", type=int, default=6,
     help="Number of concurrent workers for LCSC requests")
+@click.option("--jitter-min", type=float, default=0.1,
+    help="Minimum jitter delay in seconds")
+@click.option("--jitter-max", type=float, default=0.3,
+    help="Maximum jitter delay in seconds")
 @click.option("--stock-only", is_flag=True, default=False,
     help="Only fetch components with stock > 0")
 @click.option("--max-seconds", type=int, default=None,
     help="Maximum runtime in seconds")
-def fetchextra(db, limit, concurrency, stock_only, max_seconds):
+@click.option("--failed-log", type=str, default="failed_components.json",
+    help="Path to save failed components log")
+def fetchextra(db, limit, offset, concurrency, jitter_min, jitter_max, stock_only, max_seconds, failed_log):
     """
     Fetch LCSC extra details and preview images for components in DB.
     """
     lib = SourceDb(db)
-    missing = lib.getMissingExtra(limit, stock_only=stock_only)
-    refreshExtraData(lib, missing, age=0, limit=limit, concurrency=concurrency, stock_only=stock_only, max_seconds=max_seconds)
+    refreshExtraData(
+        lib, [], age=0, limit=limit,
+        concurrency=concurrency,
+        stock_only=stock_only,
+        offset=offset,
+        max_seconds=max_seconds,
+        jitter_range=(jitter_min, jitter_max),
+        failed_log_path=failed_log
+    )
 
 
 

@@ -1,22 +1,25 @@
 """
-Merges the new GitHub Actions crawl results (run 36502617816) into:
+Merges downloaded GitHub Actions crawl databases into:
 1. database/jlcparts/cache.sqlite3
 2. PartShelf/data/libraries/jlcparts.db
+
+Supports passing specific database files or searching in downloads_*/
 """
 
+import sys
+import json
 import sqlite3
 import time
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-ACTION_DB = BASE_DIR / "database" / "jlcparts" / "downloads_run_36502617816" / "jlcparts_cache_database" / "cache.sqlite3"
 LOCAL_CACHE_DB = BASE_DIR / "database" / "jlcparts" / "cache.sqlite3"
 PARTSHELF_DB = BASE_DIR / "PartShelf" / "data" / "libraries" / "jlcparts.db"
 
 
-def merge_into_db(target_db_path: Path, label: str):
+def merge_into_db(action_db_path: Path, target_db_path: Path, label: str):
     print(f"\n==========================================")
-    print(f"Merging into: {label} ({target_db_path})")
+    print(f"Merging {action_db_path.name} into: {label}")
     print(f"==========================================")
     
     if not target_db_path.exists():
@@ -36,10 +39,10 @@ def merge_into_db(target_db_path: Path, label: str):
     print(f"Pre-merge: {pre_jlc:,} jlc_components, {pre_lcsc:,} lcsc_components ({pre_images:,} with images)")
 
     # Attach the action db
-    cur.execute("ATTACH DATABASE ? AS action_db", (str(ACTION_DB),))
+    cur.execute("ATTACH DATABASE ? AS action_db", (str(action_db_path),))
 
     # 1. Merge jlc_components (INSERT OR REPLACE to update stock, price, new items)
-    print("Merging jlc_components (1,099,000 rows)...")
+    print("Merging jlc_components...")
     cur.execute("""
     INSERT OR REPLACE INTO jlc_components (
         lcsc, fetched_at, present, sync_seen, category, subcategory, mfr, package, joints,
@@ -66,7 +69,10 @@ def merge_into_db(target_db_path: Path, label: str):
     ON CONFLICT(lcsc) DO UPDATE SET
         fetched_at = excluded.fetched_at,
         manufacturer = COALESCE(NULLIF(excluded.manufacturer, ''), lcsc_components.manufacturer),
-        attributes = COALESCE(NULLIF(excluded.attributes, ''), lcsc_components.attributes),
+        attributes = CASE 
+            WHEN excluded.attributes IS NOT NULL AND excluded.attributes != '{}' THEN excluded.attributes 
+            ELSE lcsc_components.attributes 
+        END,
         image = CASE 
             WHEN excluded.image IS NOT NULL AND excluded.image != '' THEN excluded.image 
             ELSE lcsc_components.image 
@@ -106,18 +112,58 @@ def merge_into_db(target_db_path: Path, label: str):
     print(f"  Images total:    {post_images:,} (+{post_images - pre_images:,})")
 
 
+def check_failed_logs(search_dir: Path):
+    failed_files = list(search_dir.glob("**/failed_components*.json"))
+    if not failed_files:
+        return
+    print("\n--- Failed Components Artifact Inspection ---")
+    for f in failed_files:
+        try:
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            total = data.get("total_requested", 0)
+            failed = data.get("total_failed", 0)
+            print(f"Log: {f.name} in {f.parent.name}")
+            print(f"  Requested: {total}, Failed: {failed}")
+            items = data.get("failed_items", [])
+            if items:
+                print("  Sample failures:")
+                for item in items[:5]:
+                    print(f"    - {item.get('lcsc')}: {item.get('error')}")
+        except Exception as e:
+            print(f"  Could not read {f}: {e}")
+
+
 def main():
-    print(f"Action DB source: {ACTION_DB}")
-    if not ACTION_DB.exists():
-        print(f"Action DB does not exist at {ACTION_DB}")
+    db_paths = []
+    if len(sys.argv) > 1:
+        for arg in sys.argv[1:]:
+            p = Path(arg)
+            if p.is_file():
+                db_paths.append(p)
+            elif p.is_dir():
+                db_paths.extend(p.glob("**/*.sqlite*"))
+    else:
+        # Auto-search in downloads_*
+        downloads_base = BASE_DIR / "database" / "jlcparts"
+        for p in downloads_base.glob("downloads_*/**/*.sqlite*"):
+            if p.is_file():
+                db_paths.append(p)
+
+    if not db_paths:
+        print("No source database files found to merge.")
+        print(f"Usage: python merge_database.py [path_to_cache.sqlite3 ...]")
         return
 
-    # Merge into PartShelf
-    merge_into_db(PARTSHELF_DB, "PartShelf jlcparts.db")
+    print(f"Found {len(db_paths)} database(s) to merge:")
+    for p in db_paths:
+        print(f"  - {p}")
 
-    # Merge into local repository cache
-    merge_into_db(LOCAL_CACHE_DB, "jlcparts/cache.sqlite3")
+    for db_path in db_paths:
+        merge_into_db(db_path, PARTSHELF_DB, "PartShelf jlcparts.db")
+        merge_into_db(db_path, LOCAL_CACHE_DB, "jlcparts/cache.sqlite3")
 
+    check_failed_logs(BASE_DIR / "database" / "jlcparts")
     print("\nAll database merges completed successfully!")
 
 

@@ -11,10 +11,19 @@ from requests.exceptions import ConnectionError
 LCSC_KEY = os.environ.get("LCSC_KEY")
 LCSC_SECRET = os.environ.get("LCSC_SECRET")
 
-def fetchLcscProductDetail(lcscNumber, session=None, timeout=10):
+class RateLimitError(Exception):
+    """Raised when LCSC API triggers rate limiting (HTTP 429, 403, or WAF challenge)."""
+    pass
+
+class LcscApiError(Exception):
+    """Raised when LCSC API returns an unexpected error."""
+    pass
+
+def fetchLcscProductDetail(lcscNumber, session=None, timeout=10, max_retries=3, backoff_base=2.0):
     """
     Fetch component details and image URLs from LCSC public API.
     Does not require any API keys or secrets.
+    Handles HTTP status code checking, rate limiting detection, and exponential backoff.
     """
     code_str = str(lcscNumber).strip()
     if not code_str.upper().startswith("C"):
@@ -26,13 +35,69 @@ def fetchLcscProductDetail(lcscNumber, session=None, timeout=10):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
     }
     client = session or requests
-    resp = client.get(url, headers=headers, timeout=timeout)
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("code") == 200:
-            return data.get("result")
+
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.get(url, headers=headers, timeout=timeout)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_error = e
+            if attempt < max_retries:
+                sleep_time = (backoff_base ** attempt) + random.uniform(0.5, 1.5)
+                time.sleep(sleep_time)
+                continue
+            raise LcscApiError(f"Network error fetching {code_str}: {e}") from e
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception as e:
+                # Returned 200 but not JSON (e.g. HTML challenge/captcha page)
+                if attempt < max_retries:
+                    sleep_time = (backoff_base ** attempt) + random.uniform(1.0, 2.0)
+                    time.sleep(sleep_time)
+                    continue
+                raise RateLimitError(f"Received non-JSON response (WAF challenge) for {code_str}") from e
+
+            code = data.get("code")
+            if code == 200:
+                return data.get("result")
+            elif code in (429, 403):
+                if attempt < max_retries:
+                    sleep_time = (backoff_base ** attempt) * 2 + random.uniform(1.0, 3.0)
+                    time.sleep(sleep_time)
+                    continue
+                raise RateLimitError(f"LCSC business code rate limit: {data.get('msg') or code} for {code_str}")
+            else:
+                return None
+
+        elif resp.status_code in (429, 403):
+            last_error = resp.status_code
+            if attempt < max_retries:
+                # Exponential backoff with random jitter: 2s, 4s, 8s...
+                sleep_time = (backoff_base ** (attempt + 1)) + random.uniform(1.0, 3.0)
+                time.sleep(sleep_time)
+                continue
+            raise RateLimitError(f"HTTP {resp.status_code} WAF/Rate limit triggered for {code_str}")
+
+        elif resp.status_code in (500, 502, 503, 504):
+            last_error = resp.status_code
+            if attempt < max_retries:
+                sleep_time = (backoff_base ** attempt) + random.uniform(0.5, 1.5)
+                time.sleep(sleep_time)
+                continue
+            raise LcscApiError(f"HTTP {resp.status_code} server error for {code_str}")
+
+        elif resp.status_code == 404:
+            return None
+        else:
+            raise LcscApiError(f"HTTP {resp.status_code} unexpected response for {code_str}")
+
+    if last_error:
+        raise RateLimitError(f"Retries exhausted for {code_str}: {last_error}")
     return None
 
 def makeLcscRequest(url, payload=None):

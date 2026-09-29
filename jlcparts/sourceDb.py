@@ -447,7 +447,11 @@ class SourceDb:
         lcsc = lcscToDb(lcscNumber)
         row = _lcscSourceFromExtra(lcsc, int(time.time()), extra)
         if row is None:
-            self.conn.execute("DELETE FROM lcsc_components WHERE lcsc = ?", (lcsc,))
+            self.conn.execute("""
+                INSERT INTO lcsc_components (lcsc, fetched_at, manufacturer, attributes, image, url_slug)
+                VALUES (?, ?, '', '{}', '', '')
+                ON CONFLICT(lcsc) DO UPDATE SET fetched_at = excluded.fetched_at
+            """, (lcsc, int(time.time())))
         else:
             self.conn.execute("""
                 INSERT INTO lcsc_components (
@@ -456,10 +460,19 @@ class SourceDb:
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(lcsc) DO UPDATE SET
                     fetched_at = excluded.fetched_at,
-                    manufacturer = excluded.manufacturer,
-                    attributes = excluded.attributes,
-                    image = excluded.image,
-                    url_slug = excluded.url_slug
+                    manufacturer = COALESCE(NULLIF(excluded.manufacturer, ''), lcsc_components.manufacturer),
+                    attributes = CASE 
+                        WHEN excluded.attributes IS NOT NULL AND excluded.attributes != '{}' THEN excluded.attributes 
+                        ELSE lcsc_components.attributes 
+                    END,
+                    image = CASE 
+                        WHEN excluded.image IS NOT NULL AND excluded.image != '' THEN excluded.image 
+                        ELSE lcsc_components.image 
+                    END,
+                    url_slug = CASE 
+                        WHEN excluded.url_slug IS NOT NULL AND excluded.url_slug != '' THEN excluded.url_slug 
+                        ELSE lcsc_components.url_slug 
+                    END
                 """, (
                     row["lcsc"], row["fetched_at"], row["manufacturer"],
                     _jsonDumps(row["attributes"]), row["image"], row["url_slug"],
@@ -476,7 +489,7 @@ class SourceDb:
             """, (count,))
         return map(lambda row: lcscFromDb(row["lcsc"]), cursor)
 
-    def getMissingExtra(self, count, stock_only=False):
+    def getMissingExtra(self, count, stock_only=False, offset=0):
         if count == 0:
             return []
         stock_filter = "AND j.stock > 0" if stock_only else ""
@@ -487,8 +500,8 @@ class SourceDb:
             WHERE (l.lcsc IS NULL OR l.image IS NULL OR l.image = '' OR l.attributes = '{{}}')
             {stock_filter}
             ORDER BY (j.stock > 0) DESC, j.stock DESC, j.preferred DESC, COALESCE(l.fetched_at, 0) ASC
-            LIMIT ?
-            """, (count,))
+            LIMIT ? OFFSET ?
+            """, (count, offset))
         return list(map(lambda row: lcscFromDb(row["lcsc"]), cursor))
 
     def setPreferred(self, lcscSet):
