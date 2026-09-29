@@ -262,7 +262,17 @@ def deploy_workflow(concurrency=6, jitter_min=0.1, jitter_max=0.3, shard_size=55
     save_state(state)
     print("State initialized in crawler_200_state.json")
 
-def sync_artifacts():
+def _download_single_shard(run_id, name, dl_dir):
+    shard_dir = dl_dir / name
+    shutil.rmtree(shard_dir, ignore_errors=True)
+    res = subprocess.run([
+        "gh", "run", "download", str(run_id), "--repo", GITHUB_REPO, "-n", name, "-D", str(shard_dir)
+    ], capture_output=True, text=True, cwd=REPO_DIR)
+    return name, shard_dir, res.returncode == 0
+
+def sync_artifacts(workers=8):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     state = load_state()
     run_id = state.get("run_id")
     if not run_id:
@@ -271,7 +281,7 @@ def sync_artifacts():
 
     print(f"Checking artifacts for Run ID {run_id}...")
     artifacts_res = run_cmd([
-        "gh", "api", f"/repos/baiyunquan/jlcparts/actions/runs/{run_id}/artifacts",
+        "gh", "api", "--paginate", f"/repos/{GITHUB_REPO}/actions/runs/{run_id}/artifacts",
         "--jq", ".artifacts[] | {id: .id, name: .name, size_in_bytes: .size_in_bytes, expired: .expired}"
     ], check=False)
 
@@ -294,7 +304,7 @@ def sync_artifacts():
 
     db_paths = [CACHE_SQLITE_PATH, PARTSHELF_DB_PATH]
 
-    new_merges = 0
+    pending_artifacts = []
     for art in artifacts:
         name = art.get("name", "")
         if not name.startswith("shard_"):
@@ -303,57 +313,108 @@ def sync_artifacts():
             shard_idx = int(name.replace("shard_", ""))
         except ValueError:
             continue
+        if shard_idx not in merged_shards:
+            pending_artifacts.append((shard_idx, art))
 
-        if shard_idx in merged_shards:
-            continue
+    pending_artifacts.sort(key=lambda x: x[0])
+    print(f"Pending shards to download and merge: {len(pending_artifacts)} (Already merged: {len(merged_shards)}/200)")
 
-        print(f"Downloading artifact {name} (ID: {art['id']})...")
-        zip_path = dl_dir / f"{name}.zip"
-        run_cmd(["gh", "api", f"/repos/baiyunquan/jlcparts/actions/artifacts/{art['id']}/zip",
-                 ">", str(zip_path)], shell=True, check=False)
+    if not pending_artifacts:
+        print("All available shards have already been merged.")
+        return
 
-        if not zip_path.exists() or zip_path.stat().st_size == 0:
-            # Fallback to gh run download
-            run_cmd(["gh", "run", "download", str(run_id), "--repo", GITHUB_REPO, "-n", name, "-D", str(dl_dir / name)], check=False)
-            extracted_sub = dl_dir / name
-            if extracted_sub.exists():
-                c_cnt, i_cnt, f_cnt = 0, 0, 0
-                delta_gz = extracted_sub / "crawled_components.json.gz"
-                if delta_gz.exists():
-                    try:
-                        with gzip.open(delta_gz, "rt", encoding="utf-8") as f:
-                            c_cnt = ingest_delta(json.load(f), db_paths)
-                    except Exception:
-                        pass
-                tar_p = extracted_sub / "images.tar.gz"
-                if tar_p.exists() and tar_p.stat().st_size > 50:
-                    PARTSHELF_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-                    try:
-                        with tarfile.open(tar_p, "r:gz") as tf:
-                            tf.extractall(PARTSHELF_IMAGES_DIR)
-                            i_cnt = len(tf.getmembers())
-                    except Exception:
-                        pass
-                shutil.rmtree(extracted_sub, ignore_errors=True)
-                merged_shards.add(shard_idx)
-                state["total_components_merged"] += c_cnt
-                state["total_images_extracted"] += i_cnt
-                new_merges += 1
-                print(f"Merged Shard {shard_idx}: {c_cnt} components, {i_cnt} images.")
-            continue
+    new_merges = 0
+    all_failed_items = []
 
-        c_cnt, i_cnt, f_cnt = process_shard_artifact(zip_path, PARTSHELF_IMAGES_DIR, db_paths)
-        zip_path.unlink(missing_ok=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_download_single_shard, run_id, art["name"], dl_dir): (shard_idx, art["name"])
+            for shard_idx, art in pending_artifacts
+        }
 
-        merged_shards.add(shard_idx)
-        state["total_components_merged"] += c_cnt
-        state["total_images_extracted"] += i_cnt
-        state["total_failures"] += f_cnt
-        new_merges += 1
-        print(f"Merged Shard {shard_idx}: {c_cnt} components, {i_cnt} images, {f_cnt} failed.")
+        total_pending = len(pending_artifacts)
+        for i, future in enumerate(as_completed(futures)):
+            shard_idx, name = futures[future]
+            try:
+                _, shard_dir, ok = future.result()
+            except Exception as e:
+                print(f"Download worker error for {name}: {e}")
+                continue
+
+            if not ok or not shard_dir.exists():
+                print(f"Warning: Failed to download artifact {name}")
+                continue
+
+            c_cnt, i_cnt, f_cnt = 0, 0, 0
+            delta_gz = shard_dir / "crawled_components.json.gz"
+            delta_json = shard_dir / "crawled_components.json"
+            items = []
+            if delta_gz.exists():
+                try:
+                    with gzip.open(delta_gz, "rt", encoding="utf-8") as f:
+                        items = json.load(f)
+                except Exception as e:
+                    print(f"Warning reading delta {delta_gz}: {e}")
+            elif delta_json.exists():
+                try:
+                    with open(delta_json, "r", encoding="utf-8") as f:
+                        items = json.load(f)
+                except Exception as e:
+                    print(f"Warning reading delta {delta_json}: {e}")
+
+            if items:
+                c_cnt = ingest_delta(items, db_paths)
+
+            tar_p = shard_dir / "images.tar.gz"
+            if tar_p.exists() and tar_p.stat().st_size > 50:
+                PARTSHELF_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+                try:
+                    with tarfile.open(tar_p, "r:gz") as tf:
+                        tf.extractall(PARTSHELF_IMAGES_DIR)
+                        i_cnt = len(tf.getmembers())
+                except Exception as e:
+                    print(f"Warning extracting {tar_p}: {e}")
+
+            failed_p = shard_dir / "failed_components.json"
+            if failed_p.exists():
+                try:
+                    with open(failed_p, "r", encoding="utf-8") as f:
+                        fdata = json.load(f)
+                        f_list = fdata.get("failed_items", [])
+                        f_cnt = len(f_list)
+                        all_failed_items.extend(f_list)
+                except Exception:
+                    pass
+
+            shutil.rmtree(shard_dir, ignore_errors=True)
+            merged_shards.add(shard_idx)
+            state["total_components_merged"] += c_cnt
+            state["total_images_extracted"] += i_cnt
+            state["total_failures"] += f_cnt
+            new_merges += 1
+
+            if (i + 1) % 10 == 0 or (i + 1) == total_pending:
+                state["merged_shards"] = sorted(list(merged_shards))
+                save_state(state)
+                pct = ((i + 1) / total_pending) * 100
+                print(f"[{i + 1}/{total_pending}] ({pct:.1f}%) | Merged Shard {shard_idx}: {c_cnt} components, {i_cnt} images | Total Merged: {len(merged_shards)}/200")
 
     state["merged_shards"] = sorted(list(merged_shards))
     save_state(state)
+
+    if all_failed_items:
+        try:
+            prev_failed = []
+            if FAILED_CONSOLIDATED_FILE.exists():
+                with open(FAILED_CONSOLIDATED_FILE, "r", encoding="utf-8") as f:
+                    prev_failed = json.load(f)
+            prev_failed.extend(all_failed_items)
+            with open(FAILED_CONSOLIDATED_FILE, "w", encoding="utf-8") as f:
+                json.dump(prev_failed, f, indent=2, ensure_ascii=False)
+            print(f"Updated consolidated failed list with {len(all_failed_items)} entries -> {FAILED_CONSOLIDATED_FILE}")
+        except Exception as e:
+            print(f"Warning writing consolidated failed list: {e}")
+
     print(f"Sync complete: {new_merges} new shards merged. Total merged: {len(merged_shards)}/200 shards.")
 
 def print_status():
