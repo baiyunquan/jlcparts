@@ -30,6 +30,7 @@ FAILED_CONSOLIDATED_FILE = REPO_DIR / "consolidated_failed_components.json"
 
 WORKFLOW_FILE = "crawl_all_matrix.yaml"
 BRANCH_NAME = "feat/lcsc-open-api-crawler"
+GITHUB_REPO = "baiyunquan/jlcparts"
 
 def run_cmd(cmd, cwd=REPO_DIR, check=True):
     print(f">> Executing: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
@@ -207,10 +208,12 @@ def deploy_workflow(concurrency=6, jitter_min=0.1, jitter_max=0.3, shard_size=55
 
     print("Pushing to remote origin...")
     run_cmd(["git", "push", "origin", BRANCH_NAME])
+    run_cmd(["git", "push", "origin", f"{BRANCH_NAME}:master"])
 
     print("Triggering GitHub Actions matrix workflow (200 shards)...")
     run_cmd([
         "gh", "workflow", "run", WORKFLOW_FILE,
+        "--repo", GITHUB_REPO,
         "--ref", BRANCH_NAME,
         "-f", f"concurrency={concurrency}",
         "-f", f"jitter_min={jitter_min}",
@@ -223,6 +226,7 @@ def deploy_workflow(concurrency=6, jitter_min=0.1, jitter_max=0.3, shard_size=55
 
     list_res = run_cmd([
         "gh", "run", "list",
+        "--repo", GITHUB_REPO,
         "--workflow", WORKFLOW_FILE,
         "--limit", "1",
         "--json", "databaseId,url,status,conclusion,createdAt"
@@ -310,7 +314,7 @@ def sync_artifacts():
 
         if not zip_path.exists() or zip_path.stat().st_size == 0:
             # Fallback to gh run download
-            run_cmd(["gh", "run", "download", str(run_id), "-n", name, "-D", str(dl_dir / name)], check=False)
+            run_cmd(["gh", "run", "download", str(run_id), "--repo", GITHUB_REPO, "-n", name, "-D", str(dl_dir / name)], check=False)
             extracted_sub = dl_dir / name
             if extracted_sub.exists():
                 c_cnt, i_cnt, f_cnt = 0, 0, 0
