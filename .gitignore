@@ -6,6 +6,9 @@ manifest.json
 *.checkpoint.json
 crawler_*_state.json
 consolidated_failed_components.json
+retry_*.json
+discontinued_*.json
+rate_limited_*.json
 temp_*
 
 # Byte-compiled / optimized / DLL files
